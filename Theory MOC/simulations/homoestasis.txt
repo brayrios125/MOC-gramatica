@@ -1,0 +1,176 @@
+import numpy as np
+from sklearn.cluster import KMeans
+import random
+import matplotlib.pyplot as plt
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+from collections import defaultdict
+import networkx as nx
+
+# ------------------- PARÁMETROS GLOBALES -------------------
+N_NEURONAS   = 50
+CONECTIVIDAD = 0.2
+TMAX         = 2000
+LR_SEMANTICO = 0.1
+ETA_PLASTICIDAD = 0.01
+UMBRAL_DOLOR = 0.8
+K_MAX_CATEGORIAS = 5
+
+# ------------------- CLASE 1: Semántica (Versión Robusta) -------------------
+class Semantica:
+    def __init__(self, max_cat=K_MAX_CATEGORIAS):
+        self.max_cat = max_cat
+        self.data = []
+        self.k = 2
+        self.model = None
+        self.pattern_len = -1
+
+    def actualizar(self, patron):
+        if not patron: return
+
+        if self.pattern_len == -1:
+            self.pattern_len = len(patron)
+        
+        if len(patron) != self.pattern_len:
+            p_list = list(patron) + [0] * (self.pattern_len - len(patron))
+            patron = tuple(p_list[:self.pattern_len])
+
+        self.data.append(patron)
+
+        if len(self.data) > 200: self.data.pop(0)
+
+        if len(self.data) % 100 == 0 and self.k < self.max_cat:
+            self.k += 1
+        
+        unique_data = np.unique(np.array(self.data), axis=0)
+        if len(unique_data) >= self.k:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=ConvergenceWarning)
+                self.model = KMeans(n_clusters=self.k, n_init='auto', random_state=0).fit(unique_data)
+
+    def predecir_categoria(self, patron):
+        if self.model is None or not patron:
+            return 0
+        
+        if not hasattr(self.model, 'cluster_centers_') or len(patron) != self.model.cluster_centers_.shape[1]:
+             return 0
+        return int(self.model.predict([patron])[0])
+
+# ------------------- CLASE 2: Neurona (con Agencia) -------------------
+class Neurona:
+    def __init__(self, idx):
+        self.id = idx
+        self.estado = random.choice([0, 1])
+        self.vecinos = []
+        self.semantica = Semantica()
+        self.Q_semantico = defaultdict(float)
+        self.kappa_pred = 1.0
+        self.prox_estado = self.estado
+
+    def set_vecinos(self, vecinos):
+        self.vecinos = vecinos
+
+    def percibir(self, neuronas):
+        if not self.vecinos: return tuple()
+        return tuple(sorted([neuronas[v].estado for v in self.vecinos]))
+
+    def decidir(self, patron):
+        cat = self.semantica.predecir_categoria(patron)
+        q_val = self.Q_semantico.get(cat, 0.0)
+        prediccion_normal = 1 if (0.5 + q_val * 0.5) > random.random() else 0
+        
+        if self.kappa_pred > UMBRAL_DOLOR:
+            self.prox_estado = 1 - prediccion_normal
+        else:
+            self.prox_estado = prediccion_normal
+        
+    def aprender(self, patron_previo, neuronas):
+        if not self.vecinos or not patron_previo: return
+        self.semantica.actualizar(patron_previo)
+        estados_reales_vecinos = tuple(sorted([neuronas[v].estado for v in self.vecinos]))
+        if not estados_reales_vecinos: return
+        cat_real = self.semantica.predecir_categoria(estados_reales_vecinos)
+        q_val_real = self.Q_semantico.get(cat_real, 0.0)
+        prediccion_ideal = 1 if q_val_real > 0 else 0
+        estado_real_agregado = 1 if sum(n.estado for n in [neuronas[v] for v in self.vecinos]) > len(self.vecinos) / 2 else 0
+        error_pred = abs(prediccion_ideal - estado_real_agregado)
+        self.kappa_pred = 0.9 * self.kappa_pred + 0.1 * error_pred
+        recompensa = -self.kappa_pred
+        cat_previa = self.semantica.predecir_categoria(patron_previo)
+        self.Q_semantico[cat_previa] += LR_SEMANTICO * (recompensa - self.Q_semantico[cat_previa])
+
+    def actualizar_estado(self):
+        self.estado = self.prox_estado
+
+# ------------------- CLASE 3: Mundo (con Plasticidad) -------------------
+class Mundo:
+    def __init__(self, n, p):
+        self.n = n
+        self.W = np.random.rand(n, n) * (np.random.rand(n, n) < p).astype(float)
+        np.fill_diagonal(self.W, 0)
+        self.neuronas = {i: Neurona(i) for i in range(n)}
+        self._rebuild_vecinos()
+
+    def _rebuild_vecinos(self):
+        for i in range(self.n):
+            self.neuronas[i].set_vecinos(list(np.where(self.W[i] > 0)[0]))
+
+    def _actualizar_plasticidad(self):
+        for i in range(self.n):
+            for j in range(i + 1, self.n):
+                if self.W[i, j] > 0:
+                    exito = 1 if self.neuronas[i].estado == self.neuronas[j].estado else -1
+                    cambio = ETA_PLASTICIDAD * (exito * 0.1 - self.W[i, j] * 0.005)
+                    self.W[i, j] = max(0, min(1, self.W[i, j] + cambio))
+                    self.W[j, i] = self.W[i, j]
+        self._rebuild_vecinos()
+
+    def paso(self):
+        patrones_previos = {i: n.percibir(self.neuronas) for i, n in self.neuronas.items()}
+        for i, n in self.neuronas.items(): n.decidir(patrones_previos[i])
+        for n in self.neuronas.values(): n.actualizar_estado()
+        for i, n in self.neuronas.items(): n.aprender(patrones_previos[i], self.neuronas)
+        self._actualizar_plasticidad()
+
+    def medida_global(self):
+        kappas_p = [n.kappa_pred for n in self.neuronas.values()]
+        k_values = [n.semantica.k for n in self.neuronas.values()]
+        num_conexiones = np.count_nonzero(self.W)
+        return np.mean(kappas_p), np.mean(k_values), num_conexiones
+
+# ------------------- SIMULACIÓN PRINCIPAL -------------------
+if __name__ == '__main__':
+    m = Mundo(N_NEURONAS, CONECTIVIDAD)
+    hist = {'kp':[], 'k_mean':[], 'conexiones':[]}
+
+    print(">> INICIANDO SIMULACIÓN (Acto II: Agencia y Plasticidad) <<\n")
+    for t in range(TMAX):
+        m.paso()
+        if t % 50 == 0 or t == TMAX - 1:
+            kp, k_mean, con = m.medida_global()
+            hist['kp'].append(kp)
+            hist['k_mean'].append(k_mean)
+            hist['conexiones'].append(con)
+            print(f"t={t:4d} | ?_pred_global={kp:.4f} | K Promedio={k_mean:.2f} | Conexiones={con}")
+
+    # --- GRAFICAR RESULTADOS ---
+    fig, ax1 = plt.subplots(figsize=(14, 7))
+    timesteps_reported = [i*50 for i in range(len(hist['kp']))]
+    
+    ax1.set_xlabel('Paso de tiempo')
+    ax1.set_ylabel('?_pred Global (Error)', color='blue')
+    ax1.plot(timesteps_reported, hist['kp'], color='blue', marker='o', label='?_pred Global (Error)')
+    ax1.tick_params(axis='y', labelcolor='blue')
+    ax1.grid(True)
+
+    ax2 = ax1.twinx()
+    color = 'red'
+    ax2.set_ylabel('Evolución del Sistema', color=color)
+    ax2.plot(timesteps_reported, hist['k_mean'], color=color, linestyle='--', label='K Promedio (Complejidad Semántica)')
+    ax2.plot(timesteps_reported, hist['conexiones'], color='green', linestyle=':', label='Nº Conexiones (Complejidad Estructural)')
+    ax2.tick_params(axis='y', labelcolor=color)
+    ax2.legend(loc='upper right')
+    
+    fig.tight_layout()
+    plt.title('Evolución de un Sistema con Agencia y Plasticidad')
+    plt.show()
